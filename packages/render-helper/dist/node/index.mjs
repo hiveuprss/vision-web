@@ -771,6 +771,27 @@ function buildPictureSources(rawUrl) {
   return { avif, webp };
 }
 
+// src/methods/image-dimensions.ts
+var MAX_IMAGE_DIMENSION_PX = 8192;
+var MAX_IMAGE_DIMENSION_RATIO = 40;
+function parsePixelDimension(value) {
+  if (value == null) return null;
+  const trimmed = value.trim();
+  if (!/^\d{1,4}$/.test(trimmed)) return null;
+  const n = Number(trimmed);
+  if (n < 1 || n > MAX_IMAGE_DIMENSION_PX) return null;
+  return n;
+}
+function authorPixelSize(width, height) {
+  const w = parsePixelDimension(width);
+  const h = parsePixelDimension(height);
+  if (w == null || h == null) return null;
+  const larger = Math.max(w, h);
+  const smaller = Math.min(w, h);
+  if (larger / smaller > MAX_IMAGE_DIMENSION_RATIO) return null;
+  return { width: String(w), height: String(h) };
+}
+
 // src/methods/sanitize-html.method.ts
 var EMBED_SRC_DATA_ATTRS = /* @__PURE__ */ new Set(["data-embed-src", "data-video-href"]);
 var isSafeNavValue = (value) => {
@@ -785,9 +806,34 @@ var isProxyPSrcset = (srcset) => {
   const candidates = srcset.split(",").map((c) => c.trim().split(/\s+/)[0]).filter(Boolean);
   return candidates.length > 0 && candidates.every((url) => url.startsWith(`${base}/p/`));
 };
-function sanitizeHtml(html) {
+var QUOTED_ATTR = /\s([^\s"'>\/=]+)="([^"]*)"/g;
+function enforceImageDimensionPair(html) {
+  return html.replace(/<img\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi, (tag) => {
+    QUOTED_ATTR.lastIndex = 0;
+    const attrs = [];
+    let match;
+    while (match = QUOTED_ATTR.exec(tag)) {
+      attrs.push({ name: match[1].toLowerCase(), value: decodeEntities(match[2]) });
+    }
+    const width = attrs.find((attr) => attr.name === "width")?.value;
+    const height = attrs.find((attr) => attr.name === "height")?.value;
+    const src = (attrs.find((attr) => attr.name === "src")?.value ?? "").trim();
+    if (src && authorPixelSize(width, height)) return tag;
+    QUOTED_ATTR.lastIndex = 0;
+    return tag.replace(
+      QUOTED_ATTR,
+      (full, name) => name.toLowerCase() === "width" || name.toLowerCase() === "height" ? "" : full
+    );
+  });
+}
+function sanitizeHtml(html, options) {
+  const preserveImageDimensions = !!options?.preserveImageDimensions;
+  const whiteList = preserveImageDimensions ? {
+    ...ALLOWED_ATTRIBUTES,
+    img: [...ALLOWED_ATTRIBUTES.img ?? [], "width", "height"]
+  } : ALLOWED_ATTRIBUTES;
   const cleaned = xss(html, {
-    whiteList: ALLOWED_ATTRIBUTES,
+    whiteList,
     stripIgnoreTag: true,
     stripIgnoreTagBody: ["style"],
     css: false,
@@ -806,6 +852,9 @@ function sanitizeHtml(html) {
       if ((tag === "video" || tag === "audio") && ["src", "poster"].includes(name) && !/^https?:\/\//.test(decodedLower)) return "";
       if (tag === "audio" && name === "preload" && decodedLower !== "metadata" && decodedLower !== "none") return "";
       if (tag === "img" && ["dynsrc", "lowsrc"].includes(name)) return "";
+      if (tag === "img" && (name === "width" || name === "height")) {
+        if (!preserveImageDimensions || parsePixelDimension(decoded) == null) return "";
+      }
       if (tag === "span" && name === "class" && decoded.toLowerCase().trim() === "wr") return "";
       if (EMBED_SRC_DATA_ATTRS.has(name) && !isAllowedEmbedSrc(decoded)) return "";
       if (name === "data-href" && !isSafeNavValue(decoded)) return "";
@@ -815,10 +864,31 @@ function sanitizeHtml(html) {
       return void 0;
     }
   });
-  return cleaned.replace(
+  const withoutBareSource = cleaned.replace(
     /<source\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi,
     (t) => /\btype\s*=\s*["'](?:image\/avif|image\/webp)["']/i.test(t) ? t : ""
   );
+  return preserveImageDimensions ? enforceImageDimensionPair(withoutBareSource) : withoutBareSource;
+}
+
+// src/bitchute-thumbnail.ts
+var origin = "";
+var ORIGIN_RE = /^https:\/\/[a-z0-9.-]+(?::\d+)?$/i;
+var ID_RE = /^[A-Za-z0-9]{1,64}$/;
+function setBitchuteThumbnailOrigin(next) {
+  if (typeof next !== "string") {
+    origin = "";
+    return;
+  }
+  const trimmed = next.trim().replace(/\/+$/, "");
+  origin = ORIGIN_RE.test(trimmed) ? trimmed : "";
+}
+function getBitchuteThumbnailOrigin() {
+  return origin;
+}
+function bitchuteThumbnailUrl(id) {
+  if (!origin || !ID_RE.test(id)) return null;
+  return `${origin}/api/bitchute-thumbnail/${id}`;
 }
 
 // src/methods/img.method.ts
@@ -846,9 +916,10 @@ function wrapInPicture(el, rawUrl) {
   picture.appendChild(webp);
   picture.appendChild(el);
 }
-function img(el, state, forApp = true) {
+function img(el, state, forApp = true, renderOptions) {
   const src = el.getAttribute("src") || "";
   const decodedSrc = decodeImageSrc(src);
+  const reserved = renderOptions?.preserveImageDimensions ? authorPixelSize(el.getAttribute("width"), el.getAttribute("height")) : null;
   ["onerror", "dynsrc", "lowsrc", "width", "height"].forEach((attr) => el.removeAttribute(attr));
   const isInvalid = !src || decodedSrc.startsWith("javascript") || decodedSrc.startsWith("vbscript") || decodedSrc === "x";
   if (isInvalid) {
@@ -863,6 +934,10 @@ function img(el, state, forApp = true) {
     el.removeAttribute("srcset");
     el.removeAttribute("sizes");
     return;
+  }
+  if (reserved) {
+    el.setAttribute("width", reserved.width);
+    el.setAttribute("height", reserved.height);
   }
   el.setAttribute("itemprop", "image");
   const avatarRoute = new RegExp(`^${trimTrailingSlash(getProxyBase()).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/u/[^/]+/avatar(?:/[a-z]+)?$`);
@@ -953,7 +1028,7 @@ function getExternalLinkRel(seoContext) {
   }
   return "nofollow ugc noopener";
 }
-function renderPlainVideoLink(el, provider, embedSrc, renderOptions) {
+function renderPlainVideoLink(el, provider, embedSrc, renderOptions, thumbnailSrc) {
   const baseClass = `markdown-video-link markdown-video-link-${provider}`;
   el.setAttribute("class", baseClass);
   el.removeAttribute("href");
@@ -975,6 +1050,13 @@ function renderPlainVideoLink(el, provider, embedSrc, renderOptions) {
     el.appendChild(wrapper);
     el.setAttribute("class", `${baseClass} er-embed`);
     return;
+  }
+  if (thumbnailSrc) {
+    const thumbImg = el.ownerDocument.createElement("img");
+    thumbImg.setAttribute("class", "no-replace video-thumbnail");
+    thumbImg.setAttribute("itemprop", "thumbnailUrl");
+    thumbImg.setAttribute("src", thumbnailSrc);
+    el.appendChild(thumbImg);
   }
   const play = el.ownerDocument.createElement("span");
   play.setAttribute("class", "markdown-video-play");
@@ -1318,7 +1400,15 @@ function a(el, forApp, parentDomain = "ecency.com", seoContext, renderOptions) {
   }
   const BCmatch = href.match(BITCHUTE_REGEX);
   if (BCmatch && BCmatch[1] && el.textContent.trim() === href) {
-    renderPlainVideoLink(el, "bitchute", `https://www.bitchute.com/embed/${BCmatch[1]}/`, renderOptions);
+    const thumbRaw = bitchuteThumbnailUrl(BCmatch[1]);
+    const thumb = thumbRaw ? proxifyImageSrc(thumbRaw, 0, 0, "match") : "";
+    renderPlainVideoLink(
+      el,
+      "bitchute",
+      `https://www.bitchute.com/embed/${BCmatch[1]}/`,
+      renderOptions,
+      thumb || void 0
+    );
     return;
   }
   const RBmatch = href.match(RUMBLE_REGEX);
@@ -2032,7 +2122,7 @@ function traverse(node, forApp, depth = 0, state = { firstImageFound: false }, p
       text(child, forApp, renderOptions);
     }
     if (child.nodeName.toLowerCase() === "img") {
-      img(child, state, forApp);
+      img(child, state, forApp, renderOptions);
     }
     if (child.nodeName.toLowerCase() === "p") {
       p(child);
@@ -10211,7 +10301,7 @@ function markdownToHTML(input, forApp, parentDomain = "ecency.com", seoContext, 
     output = serializer.serializeToString(doc);
   } catch (error) {
     try {
-      const preSanitized = sanitizeHtml(output);
+      const preSanitized = sanitizeHtml(output, renderOptions);
       const dom = htmlparser2.parseDocument(preSanitized, {
         // lenient options - don't throw on malformed HTML
         lowerCaseTags: false,
@@ -10222,7 +10312,7 @@ function markdownToHTML(input, forApp, parentDomain = "ecency.com", seoContext, 
       traverse(doc, forApp, 0, { firstImageFound: false }, parentDomain, seoContext, renderOptions);
       output = serializer.serializeToString(doc);
     } catch (fallbackError) {
-      output = sanitizeHtml(output || md.render(input));
+      output = sanitizeHtml(output || md.render(input), renderOptions);
     }
   }
   if (forApp && output && entityPlaceholders.length > 0) {
@@ -10232,7 +10322,7 @@ function markdownToHTML(input, forApp, parentDomain = "ecency.com", seoContext, 
     });
   }
   output = output.replace(/ xmlns="http:\/\/www.w3.org\/1999\/xhtml"/g, "").replace(/^<\?xml[^?]*\?>/, "").replace(/^<!DOCTYPE[^>]*>/i, "").replace(/<\/?html[^>]*>/g, "").replace(/<head[^>]*>[\s\S]*?<\/head>/g, "").replace('<body id="root">', "").replace("</body>", "").trim();
-  return sanitizeHtml(output);
+  return sanitizeHtml(output, renderOptions);
 }
 
 // src/methods/simple-markdown-to-html.method.ts
@@ -10289,7 +10379,8 @@ function markdown2Html(obj, forApp = true, _webp = false, parentDomain = "ecency
     logIfSlow(performance.now() - t02, `body_len=${obj.length}`);
     return res2;
   }
-  const key = `${makeEntryCacheKey(obj)}-md-${forApp ? "app" : "site"}-${parentDomain}${seoContext ? `-seo${seoContext.authorReputation ?? ""}-${seoContext.postPayout ?? ""}` : ""}${renderOptions?.embedVideosDirectly ? "-embed" : ""}${renderOptions?.inertAuthorAndTagChips ? "-inert" : ""}${renderOptions?.externalProfileBase ? "-ext" + renderOptions.externalProfileBase : ""}`;
+  const bitchuteOrigin = getBitchuteThumbnailOrigin();
+  const key = `${makeEntryCacheKey(obj)}-md-${forApp ? "app" : "site"}-${parentDomain}${seoContext ? `-seo${seoContext.authorReputation ?? ""}-${seoContext.postPayout ?? ""}` : ""}${renderOptions?.embedVideosDirectly ? "-embed" : ""}${renderOptions?.inertAuthorAndTagChips ? "-inert" : ""}${renderOptions?.externalProfileBase ? "-ext" + renderOptions.externalProfileBase : ""}${renderOptions?.preserveImageDimensions ? "-imgdim" : ""}${bitchuteOrigin ? `-bcthumb${bitchuteOrigin}` : ""}`;
   const item = entryMemoGet(key, obj.body);
   if (item !== MEMO_MISS) {
     return item;
@@ -10546,6 +10637,7 @@ var HTML_IMAGE_RE = /<img\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']/i;
 var URL_TOKEN_RE = /https?:\/\/[^\s<>"'()[\]]+/gi;
 var IMAGE_EXT_G = /\.(?:tiff?|jpe?g|gif|png|svg|ico|heic|webp|arw)/gi;
 var YOUTUBE_ID_RE = /^[^"&?/\s]{11}$/;
+var BITCHUTE_ID_RE = /^[A-Za-z0-9]{1,64}$/;
 function imageToken(token) {
   let end = -1;
   for (const m of token.matchAll(IMAGE_EXT_G)) {
@@ -10588,6 +10680,23 @@ function youtubeIdOf(url) {
   }
   if (segments.length >= 3) return candidate(segments[segments.length - 1]);
   return null;
+}
+function bitchuteIdOf(url) {
+  const m = /^https?:\/\/([^/?#]+)/i.exec(url);
+  if (!m) return null;
+  const host = m[1].toLowerCase();
+  if (host !== "bitchute.com" && host !== "www.bitchute.com") return null;
+  const rest = url.slice(m[0].length);
+  const hashAt = rest.indexOf("#");
+  const beforeHash = hashAt === -1 ? rest : rest.slice(0, hashAt);
+  const qAt = beforeHash.indexOf("?");
+  const path = qAt === -1 ? beforeHash : beforeHash.slice(0, qAt);
+  const segments = path.split("/").filter((seg) => seg.length > 0);
+  if (segments.length < 2) return null;
+  const kind = segments[0].toLowerCase();
+  if (kind !== "video" && kind !== "embed") return null;
+  const id = segments[1];
+  return BITCHUTE_ID_RE.test(id) ? id : null;
 }
 function isAutolinkAt(text3, idx) {
   return /^https?:\/\//i.test(text3.slice(idx, idx + 8));
@@ -10719,6 +10828,12 @@ function prepareBody(body) {
   };
 }
 function findFirstVideoPoster(prepared) {
+  const yt = findFirstYoutubePoster(prepared);
+  const bc = findFirstBitchutePoster(prepared);
+  if (yt && bc) return yt.pos <= bc.pos ? yt : bc;
+  return yt ?? bc;
+}
+function findFirstYoutubePoster(prepared) {
   const { cleaned } = prepared;
   if (!cleaned) return null;
   let best = null;
@@ -10741,6 +10856,32 @@ function findFirstVideoPoster(prepared) {
   }
   if (!best) return null;
   return { url: `https://img.youtube.com/vi/${best.url.split("?")[0]}/hqdefault.jpg`, pos: best.pos };
+}
+function findFirstBitchutePoster(prepared) {
+  if (!getBitchuteThumbnailOrigin()) return null;
+  const { cleaned } = prepared;
+  if (!cleaned || cleaned.toLowerCase().indexOf("bitchute.com") === -1) return null;
+  let best = null;
+  for (const hit of standaloneMatches(prepared.video, bitchuteIdOf)) {
+    best = { id: hit.url, pos: hit.pos };
+    break;
+  }
+  for (const m of cleaned.matchAll(MD_LINK_RE)) {
+    const idx = m.index ?? 0;
+    if (idx > 0 && cleaned[idx - 1] === "!") continue;
+    if (best && idx >= best.pos) break;
+    const href = m[2];
+    if (href && m[1].trim() === href) {
+      const id = bitchuteIdOf(href);
+      if (id) {
+        best = { id, pos: idx };
+        break;
+      }
+    }
+  }
+  if (!best) return null;
+  const url = bitchuteThumbnailUrl(best.id);
+  return url ? { url, pos: best.pos } : null;
 }
 var NONE = { candidate: null, ambiguous: false };
 var AMBIGUOUS = { candidate: null, ambiguous: true };
@@ -10947,7 +11088,8 @@ function catchPostImage(obj, width = 0, height = 0, format = "match", options = 
     }
     return null;
   }
-  const key = `${makeEntryCacheKey(obj)}-${width}x${height}-${format}${fastMode ? "-fast" : ""}`;
+  const bitchuteOrigin = getBitchuteThumbnailOrigin();
+  const key = `${makeEntryCacheKey(obj)}-${width}x${height}-${format}${fastMode ? "-fast" : ""}${bitchuteOrigin ? `-bcthumb${bitchuteOrigin}` : ""}`;
   const meta = metaFingerprint(obj.json_metadata);
   const item = entryMemoGet(key, obj.body, meta);
   if (item !== MEMO_MISS) {
@@ -11050,6 +11192,6 @@ function getPostBodySummary(obj, length, platform) {
   return res;
 }
 
-export { IMAGE_SIZES, SECTION_LIST, buildPictureSources, buildSrcSet, buildSrcSetForFormat, catchPostImage, getEntryCardImageRawUrl, getEntryImageRawUrl, isAllowedEmbedSrc, isLegacySizedProxyUrl, isPictureEligibleRawUrl, isValidPermlink, getPostBodySummary as postBodySummary, proxifyImageSrc, markdown2Html as renderPostBody, setCacheSize, setProxyBase, setSlowRenderThresholdMs, simpleMarkdownToHTML };
+export { IMAGE_SIZES, SECTION_LIST, buildPictureSources, buildSrcSet, buildSrcSetForFormat, catchPostImage, getEntryCardImageRawUrl, getEntryImageRawUrl, isAllowedEmbedSrc, isLegacySizedProxyUrl, isPictureEligibleRawUrl, isValidPermlink, getPostBodySummary as postBodySummary, proxifyImageSrc, markdown2Html as renderPostBody, setBitchuteThumbnailOrigin, setCacheSize, setProxyBase, setSlowRenderThresholdMs, simpleMarkdownToHTML };
 //# sourceMappingURL=index.mjs.map
 //# sourceMappingURL=index.mjs.map
