@@ -38,6 +38,19 @@ interface RenderOptions {
      * internal is the point of a self-hosted blog.
      */
     externalProfileBase?: string;
+    /**
+     * When true, author-supplied pixel `width` and `height` on a body `<img>`
+     * are kept. Browsers map that pair to an aspect ratio, so a consumer whose
+     * images are `max-width: 100%; height: auto` reserves the box before the
+     * file loads. The default strips both attributes, which is what every
+     * current consumer renders, so opting in is a layout change: the author's
+     * pixel size becomes the reserved box (still capped by `max-width`).
+     *
+     * Only a unitless pair inside a sane range is kept. Percentages, a single
+     * side, and `style` are not: `style` stays blocked outright, because it is
+     * the attribute an author would use to inject CSS.
+     */
+    preserveImageDimensions?: boolean;
 }
 
 /**
@@ -201,6 +214,8 @@ declare function isAllowedEmbedSrc(value?: string | null): boolean;
 
 declare function isValidPermlink(permlink: string): boolean;
 
+declare function setBitchuteThumbnailOrigin(next: string): void;
+
 /**
  * Lightweight markdown-to-HTML conversion with sanitization.
  * Unlike the full `markdownToHTML`, this skips Hive-specific transforms
@@ -211,4 +226,4 @@ declare function isValidPermlink(permlink: string): boolean;
  */
 declare function simpleMarkdownToHTML(input: string): string;
 
-export { type Entry, IMAGE_SIZES, type ProxifyOptions, type RenderOptions, SECTION_LIST, type SeoContext, buildPictureSources, buildSrcSet, buildSrcSetForFormat, catchPostImage, getEntryCardImageRawUrl, getEntryImageRawUrl, isAllowedEmbedSrc, isLegacySizedProxyUrl, isPictureEligibleRawUrl, isValidPermlink, getPostBodySummary as postBodySummary, proxifyImageSrc, markdown2Html as renderPostBody, setCacheSize, setProxyBase, setSlowRenderThresholdMs, simpleMarkdownToHTML };
+export { type Entry, IMAGE_SIZES, type ProxifyOptions, type RenderOptions, SECTION_LIST, type SeoContext, buildPictureSources, buildSrcSet, buildSrcSetForFormat, catchPostImage, getEntryCardImageRawUrl, getEntryImageRawUrl, isAllowedEmbedSrc, isLegacySizedProxyUrl, isPictureEligibleRawUrl, isValidPermlink, getPostBodySummary as postBodySummary, proxifyImageSrc, markdown2Html as renderPostBody, setBitchuteThumbnailOrigin, setCacheSize, setProxyBase, setSlowRenderThresholdMs, simpleMarkdownToHTML };
